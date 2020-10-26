@@ -545,6 +545,19 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
   } else
     strncpy((char*) &guid[2], name, 11);
 
+  if (strstr(name, "Motion Sensors"))
+  {
+    /* Don't use Dualshock 3 motion sensors device */
+    if (verbose)
+    {
+      fprintf(stderr, "ignoring dualshock 3 motion sensors device %s\n", name);
+      fflush(stderr);
+    }
+    libevdev_free(evdev);
+    close(fd);
+    return;
+  }
+
   char str_guid[33];
   char* buf = str_guid;
   for (int i = 0; i < 16; i++)
