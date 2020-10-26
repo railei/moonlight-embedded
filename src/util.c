@@ -29,7 +29,7 @@ int blank_fb(char *path, bool clear) {
   int fd = open(path, O_RDWR);
 
   if(fd >= 0) {
-    int ret = write(fd, clear ? "1" : "0", 1);
+    int ret = write(fd, clear ? "0" : "1", 1);
     if (ret < 0)
       fprintf(stderr, "Failed to clear framebuffer %s: %d\n", path, ret);
 

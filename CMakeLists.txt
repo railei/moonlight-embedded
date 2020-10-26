@@ -184,4 +184,4 @@ add_subdirectory(docs)
 
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES gamecontrollerdb.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
-install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR})
+install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/moonlight)
