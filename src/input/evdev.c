@@ -17,6 +17,8 @@
  * along with Moonlight; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#define WANT_MOUSE_EMULATION 1
+
 #include "evdev.h"
 
 #include "keyboard.h"
@@ -39,6 +41,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <endian.h>
+#ifdef WANT_MOUSE_EMULATION
+#include <sys/timerfd.h>
+#endif
 
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 #define int16_to_le(val) val
@@ -58,6 +63,17 @@ struct input_device {
   bool is_keyboard;
   bool is_mouse;
   bool is_touchscreen;
+
+#ifdef WANT_MOUSE_EMULATION
+  /* Current status of mouse emulation mode */
+  bool is_mouseEmulation;
+  struct timeval emulationDebounce;
+  short emulationX, emulationY;
+  uint64_t emulationRepeat;
+  int mouseEmulationButtonFlagA;
+  int mouseEmulationButtonFlagB;
+#endif
+
   int rotate;
   struct mapping* map;
   int key_map[KEY_MAX];
@@ -70,7 +86,7 @@ struct input_device {
   struct timeval touchDownTime;
   short controllerId;
   int haptic_effect_id;
-  int buttonFlags;
+  short buttonFlags;
   char leftTrigger, rightTrigger;
   short leftStickX, leftStickY;
   short rightStickX, rightStickY;
@@ -108,6 +124,22 @@ int evdev_gamepads = 0;
 #define ACTION_MODIFIERS (MODIFIER_SHIFT|MODIFIER_ALT|MODIFIER_CTRL)
 #define QUIT_KEY KEY_Q
 #define QUIT_BUTTONS (PLAY_FLAG|BACK_FLAG|LB_FLAG|RB_FLAG)
+
+
+#ifdef WANT_MOUSE_EMULATION
+static int timerfd = -1;
+static int timerEmulationDevices = 0;
+
+/* Definition of buttons to activate/deactivate mouse emulation */
+#define EMULATION_BUTTONS (LS_CLK_FLAG|RS_CLK_FLAG|LB_FLAG|RB_FLAG)
+#define EMULATION_MOUSE_BUTTON_MASK (~(short)(A_FLAG|B_FLAG))
+#define EMULATION_DEBOUNCE 1000 // milliseconds
+#define EMULATION_REPEAT ((uint64_t)75) // milliseconds
+
+static void start_stop_timer(int fd, struct input_device *dev);
+static int emulation_handle(int fd);
+
+#endif
 
 static bool (*handler) (struct input_event*, struct input_device*);
 
@@ -182,6 +214,8 @@ static char evdev_convert_value_byte(struct input_event *ev, struct input_device
 
 static bool evdev_handle_event(struct input_event *ev, struct input_device *dev) {
   bool gamepadModified = false;
+  bool mouseEmulationButtonFlagA = false;
+  bool mouseEmulationButtonFlagB = false;
 
   switch (ev->type) {
   case EV_SYN:
@@ -220,7 +254,11 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
         if (dev->controllerId < 0)
           dev->controllerId = 0;
       }
+#ifdef WANT_MOUSE_EMULATION
+      LiSendMultiControllerEvent(dev->controllerId, assignedControllerIds, dev->buttonFlags & EMULATION_MOUSE_BUTTON_MASK, dev->leftTrigger, dev->rightTrigger, dev->leftStickX, dev->leftStickY, dev->rightStickX, dev->rightStickY);
+#else
       LiSendMultiControllerEvent(dev->controllerId, assignedControllerIds, dev->buttonFlags, dev->leftTrigger, dev->rightTrigger, dev->leftStickX, dev->leftStickY, dev->rightStickX, dev->rightStickY);
+#endif
       dev->gamepadModified = false;
     }
     break;
@@ -445,6 +483,92 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
   if (gamepadModified && (dev->buttonFlags & QUIT_BUTTONS) == QUIT_BUTTONS)
     return false;
 
+#ifdef WANT_MOUSE_EMULATION
+  /* Check special button combination for activating/deactivating mouse emulation mode */
+  if (gamepadModified && (dev->buttonFlags & EMULATION_BUTTONS) == EMULATION_BUTTONS)
+  {
+    struct timeval elapsedTime;
+    timersub(&ev->time, &dev->emulationDebounce, &elapsedTime);
+    if ((elapsedTime.tv_sec * 1000 + elapsedTime.tv_usec / 1000) >= EMULATION_DEBOUNCE)
+    {
+      dev->emulationDebounce = ev->time;
+
+      /* Toggle status and clear emulation status */
+      dev->is_mouseEmulation = !dev->is_mouseEmulation;
+      dev->emulationX = 0;
+      dev->emulationY = 0;
+      dev->mouseEmulationButtonFlagA = false;
+      dev->mouseEmulationButtonFlagB = false;
+      dev->emulationRepeat = LiGetMillis();
+      start_stop_timer(timerfd, dev);
+      fprintf(stderr, "Mouse emulation turned %s.\n", dev->is_mouseEmulation?"on":"off");
+    }
+  }
+
+  /* If mouse emulation is on, convert left stick X/Y movement to mouse X/Y and change
+   * Buttons X/Y to mouse button left/right
+   */
+  if (dev->is_mouseEmulation)
+  {
+    if (ev->type != EV_SYN)
+    {
+      /* Implement mouse movement (performed in next SYN loop). */
+      int index = dev->abs_map[ev->code];
+      bool stickMoved = false;
+      if (index == dev->map->abs_leftx)
+      {
+        dev->emulationX = dev->leftStickX >> 12;
+#ifdef DEBUG
+        fprintf(stderr, "Emulate Mouse Move X: x=%d/%d, y=%d.\n",
+            dev->emulationX, dev->leftStickX, dev->emulationY);
+#endif
+        dev->leftStickX = 0U;
+        stickMoved = true;
+      }
+      else if (index == dev->map->abs_lefty)
+      {
+        dev->emulationY = -dev->leftStickY >> 12;
+#ifdef DEBUG
+        fprintf(stderr, "Emulate Mouse Move Y: x=%d, y=%d/%d.\n",
+            dev->emulationX, dev->emulationY, dev->leftStickY);
+#endif
+        dev->leftStickY = 0U;
+        stickMoved = true;
+      }
+      if (stickMoved)
+      {
+        dev->emulationRepeat = LiGetMillis();
+        dev->mouseDeltaY = dev->emulationY;
+        dev->mouseDeltaX = dev->emulationX;
+      }
+
+
+      /* Immediately handle mouse buttons. Use structure to remember previous state and 
+       * generate button press/release events.
+       */
+      mouseEmulationButtonFlagA = (dev->buttonFlags & A_FLAG);
+      mouseEmulationButtonFlagB = (dev->buttonFlags & B_FLAG);
+
+      if (dev->mouseEmulationButtonFlagA != mouseEmulationButtonFlagA)
+      {
+#ifdef DEBUG
+        fprintf(stderr, "Emulate left Mouse %s.\n", mouseEmulationButtonFlagA?"click":"release");
+#endif
+        dev->mouseEmulationButtonFlagA = mouseEmulationButtonFlagA;
+        LiSendMouseButtonEvent(mouseEmulationButtonFlagA?BUTTON_ACTION_PRESS:BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+      }
+      if (dev->mouseEmulationButtonFlagB != mouseEmulationButtonFlagB)
+      {
+#ifdef DEBUG
+        fprintf(stderr, "Emulate right Mouse %s.\n", mouseEmulationButtonFlagB?"click":"release");
+#endif
+        dev->mouseEmulationButtonFlagB = mouseEmulationButtonFlagB;
+        LiSendMouseButtonEvent(mouseEmulationButtonFlagB?BUTTON_ACTION_PRESS:BUTTON_ACTION_RELEASE, BUTTON_RIGHT);
+      }
+    }
+  }
+#endif
+
   dev->gamepadModified |= gamepadModified;
   return true;
 }
@@ -621,6 +745,11 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
   devices[dev].touchDownX = TOUCH_UP;
   devices[dev].touchDownY = TOUCH_UP;
 
+#ifdef WANT_MOUSE_EMULATION
+  /* Initialize mouse emulation mode to off */
+  devices[dev].is_mouseEmulation = false;
+#endif
+
   int nbuttons = 0;
   for (int i = BTN_JOYSTICK; i < KEY_MAX; ++i) {
     if (libevdev_has_event_code(devices[dev].dev, EV_KEY, i))
@@ -792,11 +921,167 @@ void evdev_start() {
   // Handle input events until the quit combo is pressed
 }
 
+#ifdef WANT_MOUSE_EMULATION
+static void start_stop_timer(int fd, struct input_device *dev)
+{
+  int ret;
+  struct itimerspec newValue;
+
+  if (fd < 0)
+  {
+    fprintf(stderr, "Bad file descriptor %d.\n", fd);
+    return;
+  }
+  if (!dev)
+  {
+    fprintf(stderr, "Bad device 0x%p.\n", dev);
+    return;
+  }
+
+  if (dev->is_mouseEmulation)
+  {
+    if (timerEmulationDevices == 0)
+    {
+#ifdef DEBUG
+      fprintf(stderr, "Turn on emulation timer.\n");
+#endif
+      timerEmulationDevices = 1;
+
+      /* Expire after 1 second and repeat after 100ms */
+      newValue.it_value.tv_sec = 1;
+      newValue.it_value.tv_nsec = 0;
+      newValue.it_interval.tv_sec = 0;
+      newValue.it_interval.tv_nsec = 100000000;
+
+      ret = timerfd_settime(fd, 0, &newValue, NULL);
+      if (ret == -1)
+      {
+        fprintf(stderr, "Could not start emulation timer (%d).\n", errno);
+      }
+    }
+    else
+    {
+      timerEmulationDevices++;
+    }
+  }
+  else
+  {
+    if (timerEmulationDevices > 1)
+    {
+      timerEmulationDevices--;
+    }
+    else
+    {
+#ifdef DEBUG
+      fprintf(stderr, "Turn off emulation timer.\n");
+#endif
+      timerEmulationDevices = 0;
+
+      /* Set expire time and interval to 0 to stop timer */
+      newValue.it_value.tv_sec = 0;
+      newValue.it_value.tv_nsec = 0;
+      newValue.it_interval.tv_sec = 0;
+      newValue.it_interval.tv_nsec = 0;
+
+      ret = timerfd_settime(fd, 0, &newValue, NULL);
+      if (ret == -1)
+      {
+        fprintf(stderr, "Could not stop emulation timer (%d).\n", errno);
+      }
+    }
+  }
+}
+
+static int emulation_handle(int fd)
+{
+  size_t numread;
+  uint64_t repeat;
+
+  /* Check file descriptor and exit if there is a mismatch */
+  if (timerfd != fd)
+  {
+    return LOOP_RETURN;
+  }
+
+  /* Check if any emulation is active and return if none */
+  if (!timerEmulationDevices)
+  {
+    return LOOP_OK;
+  }
+
+  /* Read file descriptor to rearm timer */
+  numread = read(fd, &repeat, sizeof(repeat));
+  if (numread != sizeof(repeat))
+  {
+    return LOOP_RETURN;
+  }
+
+  /* loop over all evdev devices and send repeat events if configured */
+  for (int i=0;i<numDevices;i++) {
+    if ((devices[i].fd >= 0) && (devices[i].is_mouseEmulation))
+    {
+      repeat = LiGetMillis();
+      if ((repeat - devices[i].emulationRepeat) >= EMULATION_REPEAT)
+      {
+        devices[i].emulationRepeat = repeat;
+        if (devices[i].emulationX != 0 || devices[i].emulationY != 0) {
+#ifdef DEBUG
+        fprintf(stderr, "Emulate Mouse Move Repeat: x=%d, y=%d.\n",
+            devices[i].emulationX, devices[i].emulationY);
+#endif
+          switch (devices[i].rotate) {
+            case 90:
+              LiSendMouseMoveEvent(devices[i].emulationY, -devices[i].emulationX);
+              break;
+            case 180:
+              LiSendMouseMoveEvent(-devices[i].emulationX, -devices[i].emulationY);
+              break;
+            case 270:
+              LiSendMouseMoveEvent(-devices[i].emulationY, devices[i].emulationX);
+              break;
+            default:
+              LiSendMouseMoveEvent(devices[i].emulationX, devices[i].emulationY);
+              break;
+          }
+        }
+      }
+    }
+  }
+  return LOOP_OK;
+}
+#endif
+
 void evdev_stop() {
   evdev_drain();
+
+#ifdef WANT_MOUSE_EMULATION
+  /* close timer fd */
+  if (timerfd >= 0)
+  {
+    loop_remove_fd(timerfd);
+    close(timerfd);
+    timerfd = -1;
+  }
+#endif
 }
 
 void evdev_init() {
+#ifdef WANT_MOUSE_EMULATION
+  /* initialize timer fd to prepare for handling of mouse emulation refreshes */
+  if (timerfd < 0)
+  {
+    timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC|TFD_NONBLOCK);
+    if (timerfd == -1)
+    {
+      fprintf(stderr, "Failed to get timer fd.\n");
+    }
+    else
+    {
+      loop_add_fd(timerfd, &emulation_handle, POLLIN);
+    }
+  }
+
+#endif
   handler = evdev_handle_event;
 }
 
